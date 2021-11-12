@@ -8,75 +8,94 @@
 #include <sys/ioctl.h>
 #include <sys/types.h>
 #include <sys/mman.h>
+#include <sys/uio.h>
 #include <arpa/inet.h>
 #include <netinet/in.h> 
+#include "smartdac_regs.h"
  
 #define BUFLEN 512
 #define PORT_LOCAL 	8887
-#define PORT_REMOTE 8888
 #define MAX_CLIENTS 1
 #define NUM_PACKETS_TIMEOUT 100000
  
+//Mapped memory definitions
+//OCM (sampled values)
 #define OCM_BASEADDR 			0xFFFC0000
-#define OCM_MAPSIZE 			(64*1024)
-//#define OCM_OFFSET_TIMESTAMP	0x00000FF8
-//#define OCM_PAGE_INC			0x00001000				
-
+#define OCM_MAPSIZE 			(64*1024)				
+//AXI Registers
 #define REGS_BASEADDR 			0x80000000
 #define REGS_MAPSIZE 			(4*1024)
-#define REGS_OFFSET_TRIGGER		0x00000004
 
-#define DMA_NUM_SIGNALS			32
-//#define DMA_NUM_SIGNALS			128
-#define DMA_BUFFER_LENGTH		0x10000 	// 64K = 1024*32*2
-#define DMA_DATA_LENGTH			(2*DMA_NUM_SIGNALS)
-#define DMA_OFFSET_TIMESTAMP	0x10
+#define TCP_BUF_SIZE 131072
+#define TCP_MAX_XMIT TCP_BUF_SIZE
 
-#define SG_NUM_PAGES		4
-#define SG_NUM_SIGNALS		8
-#define SG_OFFSET_START		0x04
-#define SG_DATA_LENGTH		(SG_NUM_SIGNALS*2)	
-#define SG_PAGE_LENGTH      (DMA_BUFFER_LENGTH/SG_NUM_PAGES)
-#define SG_SAMPLES_PER_PAGE	(SG_PAGE_LENGTH/DMA_DATA_LENGTH)
-#define SG_OFFSET_TIMESTAMP	(((SG_SAMPLES_PER_PAGE-1)*DMA_DATA_LENGTH)+DMA_OFFSET_TIMESTAMP)
- 
 int main(void) {
+	uint32_t SV_BUF_ADDRESS; 	// base address of buffer
+	uint32_t SV_BUF_PAGELEN; 	// page size of SV buffer (in bytes)
+	uint32_t SV_BUF_LENGTH;		// total length of buffer (in bytes)
+	uint32_t SV_BUF_DATANUM;	// number of sampled value signals (excl. timestamp)
+	uint32_t SV_BUF_TIMEOFF;	// offset of timestamp within page (in bytes)
+	
+	uint32_t SG_PAGE_NUM;		// number of SG pages into which the SV buffer is divided
+	uint32_t SG_PAGE_LENGTH;	// length of the SG pages
+	uint32_t SG_PAGE_NSAMPLES;	// number of samples per SG page
+	
+	uint64_t sv_mask;
+	uint64_t sv_window_len;
+	
+	uint8_t xmit_inProgress = 0;
+	uint8_t xmit_isPending = 0;
+	uint32_t xmit_offset;
+	uint32_t xmit_length;
+	uint32_t xmit_maxBytes;
+
 	int result;
 
 	// socket descriptors
-	int udps, tcps, client;
-	struct sockaddr_in udpAddr, tcpAddr, clientAddr;
+	int tcps, client;
+	struct sockaddr_in tcpAddr, clientAddr;
 	int slen;
+	int nbytes;
 
 	// socket tx/rx buffers
-	uint8_t txbuf[BUFLEN];
+	//uint8_t txbuf[BUFLEN];
 	uint8_t rxbuf[BUFLEN];
 
 	// flow control management
 	int bytesAvailable;
 	uint32_t isAlive;
 
-	uint8_t ch1, ch2;
 	
 	// OCM descriptors
 	int fd;
-	int runmap;
 	uint8_t* pocm;
 	uint8_t* pregs;
 
 	uint16_t pPage;
 	uint16_t pTimestamp;
+	uint32_t sgPageCount;
+	uint32_t tcpb_maxSgPages;
+	uint32_t tcpb_bytesPerSample;
+	uint32_t tcpb_bytesPerSgPage;
 
 	uint32_t timestamp;
 	uint32_t prevTimestamp;
 	
-	int i, j;
+	int i, j, k;
 	
-	struct iovec* iov;
+	//sv_mask analysis
+	uint64_t sv_mask_z2o, sv_mask_o2z;
+	uint8_t sv_mask_bi[32];
+	uint8_t sv_mask_bl[32];
+	uint8_t sv_mask_segs;
+	uint8_t sv_mask_num;
 	
-	struct msghdr msghdrs[SG_NUM_PAGES];
-	struct iovec iovecs[SG_NUM_PAGES*SG_SAMPLES_PER_PAGE];
+	struct iovec iovecs[4*4096]; // max is SG_PAGE_LENGTH/4
+	struct iovec* piovecs[4];
 	
+	int fd_buf;
+	uint16_t memory_buffer[TCP_BUF_SIZE];
+
 	// open /dev/mem for mapping
 	fd = open("/dev/mem", O_RDWR|O_SYNC);
 	if (fd == -1) {
@@ -90,42 +109,28 @@ int main(void) {
 		printf("ERROR: Failed to map OCM to memory.\n");
 		return -1;
 	}
-
-	for (i = 0; i < SG_NUM_PAGES; i++) {
-		msghdrs[i].msg_name = &udpAddr;
-		msghdrs[i].msg_namelen = sizeof(udpAddr);
-		msghdrs[i].msg_iov = &iovecs[i*SG_SAMPLES_PER_PAGE];
-		msghdrs[i].msg_iovlen = SG_SAMPLES_PER_PAGE;
-		msghdrs[i].msg_control = NULL;
-		msghdrs[i].msg_controllen = 0;
-		msghdrs[i].msg_flags = 0;
-		
-		for (j = 0; j < SG_SAMPLES_PER_PAGE; j++) {
-			iovecs[i*SG_SAMPLES_PER_PAGE + j].iov_base = &pocm[(i*SG_PAGE_LENGTH) + (j*DMA_DATA_LENGTH) + SG_OFFSET_START];
-			iovecs[i*SG_SAMPLES_PER_PAGE + j].iov_len = SG_DATA_LENGTH;
-		}
-	}
-
-/*	
-	printf("pocm = %08X\r\n\r\n", pocm);
-
-	for (i = 0; i < SG_NUM_PAGES; i++) {
-		iov = msghdrs[i].msg_iov;
-		
-		for (j = 0; j < msghdrs[i].msg_iovlen; j++) {
-			printf("msghdr[%d].msg_iov[%d].iov_base = %08X\r\n", i, j, iov[j].iov_base);
-		}
-		
-		printf("\r\n");
-	}
-*/
-
+	
 	// map registers
 	pregs = mmap(0, REGS_MAPSIZE, PROT_READ|PROT_WRITE, MAP_SHARED, fd, REGS_BASEADDR);
 	if  (pregs == MAP_FAILED) {
 		printf("ERROR: Failed to map REGS to memory.\n");
 		return -1;
 	}
+	
+	// open memory buffer
+	fd_buf = fmemopen(memory_buffer, 262144, "w");
+
+	// get SV buffer parameters
+	SV_BUF_ADDRESS 	= *(volatile uint32_t*)(pregs+NETSCOPEBA_OFFSET);
+	SV_BUF_PAGELEN 	= *(volatile uint32_t*)(pregs+NETSCOPEPL_OFFSET);
+	SV_BUF_LENGTH	= *(volatile uint32_t*)(pregs+NETSCOPEBL_OFFSET);
+	SV_BUF_DATANUM	= *(volatile uint32_t*)(pregs+NETSCOPEDL_OFFSET) + 4;	// 4 words in timestamp
+	SV_BUF_TIMEOFF	= *(volatile uint32_t*)(pregs+NETSCOPETO_OFFSET);
+	
+	// set SG page parameters
+	SG_PAGE_NUM = 4;
+	SG_PAGE_LENGTH = SV_BUF_LENGTH/SG_PAGE_NUM;
+	SG_PAGE_NSAMPLES = SG_PAGE_LENGTH/SV_BUF_PAGELEN;
 	
 	//Create TCP socket
 	tcps = socket(AF_INET, SOCK_STREAM, 0);
@@ -148,16 +153,6 @@ int main(void) {
 
 	listen(tcps, MAX_CLIENTS);
 
-	//Create UDP socket
-	udps = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-	if (udps == -1) {
-		printf("ERROR: Failed to create UDP socket.\n");
-		return(0);
-	}
-
-	udpAddr.sin_family = AF_INET;
-	udpAddr.sin_port = htons(PORT_REMOTE);
-
 	slen = sizeof(struct sockaddr_in);
 
 	while (1) {	
@@ -165,15 +160,78 @@ int main(void) {
 		client = accept(tcps, (struct sockaddr *) &clientAddr, (socklen_t*) &slen);
 		printf("Netscope client connected.\n\r");
 
-		//Set client address as destination for UDP datagrams
-		udpAddr.sin_addr.s_addr = clientAddr.sin_addr.s_addr;
+		printf("Waiting for 14 byte header from client...");
+		do {
+			ioctl(client, FIONREAD, &bytesAvailable);
+		} while (bytesAvailable < 14);
+		printf("DONE.");
+		
+		//Wait for header: 'NS' + sv_mask (64bit) + sv_window_len (32 bit)
+		nbytes = read(client, rxbuf, 14);
+		if (nbytes < 14) break;
+		if (rxbuf[0] != 'N') break;
+		if (rxbuf[1] != 'S') break;
+		printf("Received netscope header.\n");
+		
+		//Get SV mask
+		sv_mask = rxbuf[2];
+		sv_mask = (sv_mask<<8) | rxbuf[3];
+		sv_mask = (sv_mask<<8) | rxbuf[4];
+		sv_mask = (sv_mask<<8) | rxbuf[5];
+		sv_mask = (sv_mask<<8) | rxbuf[6];
+		sv_mask = (sv_mask<<8) | rxbuf[7];
+		sv_mask = (sv_mask<<8) | rxbuf[8];
+		sv_mask = (sv_mask<<8) | rxbuf[9];
+		printf("SV bitmask is 0x%llX.\n", sv_mask);
+		
+		//Get sample window length
+		sv_window_len = rxbuf[10];
+		sv_window_len = (sv_window_len<<8) | rxbuf[11];
+		sv_window_len = (sv_window_len<<8) | rxbuf[12];
+		sv_window_len = (sv_window_len<<8) | rxbuf[13];
+		printf("Window length is %lld.\n", sv_window_len);
+		
+		//Analyse sv_mask
+		sv_mask_z2o = sv_mask&(sv_mask^(sv_mask<<1));		//zero-to-one transitions
+		sv_mask_o2z = (~sv_mask)&(sv_mask^(sv_mask<<1));   	//one-to-zero transitions
+
+		j = 0; //segment counter
+		sv_mask_segs = 0;
+		sv_mask_num = 0;
+		for (i = 0; i < SV_BUF_DATANUM; i++) {
+			if (sv_mask_z2o&(1<<i)) {
+				sv_mask_bi[j] = i;
+				sv_mask_bl[j] = 1;
+				sv_mask_segs++;
+			} else if (sv_mask_o2z&(1<<i)) {
+				sv_mask_num += sv_mask_bl[j];
+				j++;
+			} else {
+				sv_mask_bl[j] = 1;
+			}
+		}
+
+		tcpb_bytesPerSample = 2*sv_mask_num;
+		tcpb_bytesPerSgPage = tcpb_bytesPerSample*SG_PAGE_NSAMPLES;
+		tcpb_maxSgPages = TCP_BUF_SIZE/tcpb_bytesPerSgPage;
+
+		//Generate iovecs for all pages
+		for (i = 0; i < SG_PAGE_NUM; i++) {
+			piovecs[i] = iovecs+(i*SG_PAGE_NSAMPLES*sv_mask_segs);
+			for (j = 0; j < SG_PAGE_NSAMPLES; j++) {
+				for (k = 0; k < sv_mask_segs; k++) {
+					iovecs[(i*SG_PAGE_NSAMPLES*sv_mask_segs) + (j*sv_mask_segs) + k].iov_base = &pocm[(i*SG_PAGE_LENGTH) + (j*SV_BUF_PAGELEN) + (2*sv_mask_bi[k])];
+					iovecs[(i*SG_PAGE_NSAMPLES*sv_mask_segs) + (j*sv_mask_segs) + k].iov_len = 2*sv_mask_bl[k]; // 2 bytes per SV
+				}
+			}
+		}
 
 		isAlive = NUM_PACKETS_TIMEOUT;
 
 		// reset sample pointers
 		pPage = 0;
-		//pTimestamp = OCM_OFFSET_TIMESTAMP;
-		pTimestamp = SG_OFFSET_TIMESTAMP;
+		pTimestamp = SV_BUF_TIMEOFF;
+		sgPageCount = 0;
 		
 		timestamp = *(volatile uint32_t*)(pocm+pTimestamp);
 		prevTimestamp = timestamp+1000000; 	// allow some time to sync
@@ -183,25 +241,78 @@ int main(void) {
 			timestamp = *(volatile uint32_t*)(pocm+pTimestamp);
 			
 			if (timestamp > prevTimestamp) {
-
-				//sendto(udps, pocm+pPage, 64, MSG_CONFIRM, (const struct sockaddr *) &udpAddr, sizeof(udpAddr));
-				//pTimestamp += OCM_PAGE_INC;
-				//pPage += OCM_PAGE_INC;
 				
-				sendmsg(udps, &msghdrs[pPage&0x03], 0);
+				pwritev(fd_buf,piovecs[pPage&0x03],SG_PAGE_NSAMPLES*sv_mask_segs,tcpb_bytesPerSgPage*sgPageCount);
 				pTimestamp += SG_PAGE_LENGTH;
 				pPage++;
+				sgPageCount++;
 				
+				//Reset buffer offset if we will overflow on next write
+				if (sgPageCount >= tcpb_maxSgPages) {
+					sgPageCount = 0;
+				}
 
 				ioctl(client, FIONREAD, &bytesAvailable);
 				if (bytesAvailable > 0) {
 					isAlive = NUM_PACKETS_TIMEOUT;
-					read(client, rxbuf, BUFLEN);
+					j = read(client, rxbuf, BUFLEN);
+					for (i = 0; i < j; i++) {
+						if (rxbuf[i]) {
+							if (xmit_inProgress) {
+								xmit_isPending = 1;
+							} else {
+								xmit_inProgress = 1;
+								xmit_length = tcpb_bytesPerSample*sv_window_len;
+								if (tcpb_bytesPerSgPage*sgPageCount < xmit_length) {
+									xmit_offset = tcpb_bytesPerSgPage*(tcpb_maxSgPages+sgPageCount)-xmit_length;
+								} else {
+									xmit_offset = tcpb_bytesPerSgPage*sgPageCount - xmit_length;
+								}
+							}
+							break;
+						}
+					}
 				}
 		
 				prevTimestamp = timestamp;
 
 				--isAlive;
+			}
+
+			if (xmit_length > 0) {
+
+				if (xmit_offset+xmit_length > tcpb_maxSgPages*tcpb_bytesPerSgPage) {
+					xmit_maxBytes = tcpb_maxSgPages*tcpb_bytesPerSgPage - xmit_offset;
+				} else if (xmit_length > TCP_MAX_XMIT) {
+					xmit_maxBytes = TCP_MAX_XMIT;
+				} else {
+					xmit_maxBytes = xmit_length;
+				}
+				nbytes = send(client, memory_buffer+xmit_offset, xmit_maxBytes, 0);
+				printf("XMIT: Sent %d bytes beginning offset 0x%X.\n", nbytes, xmit_offset);
+				if (nbytes < 0) {
+					//Error
+					isAlive = 0;
+				} else {
+					xmit_offset += nbytes;
+					xmit_length -= nbytes;
+					if (!xmit_length) {
+						if (xmit_isPending) {
+							xmit_length = tcpb_bytesPerSample*sv_window_len;
+							if (tcpb_bytesPerSgPage*sgPageCount < xmit_length) {
+								xmit_offset = tcpb_bytesPerSgPage*(tcpb_maxSgPages+sgPageCount)-xmit_length;
+							} else {
+								xmit_offset = tcpb_bytesPerSgPage*sgPageCount - xmit_length;
+							}
+						} else {
+							xmit_inProgress = 0;
+						}
+					} else {
+						if (xmit_offset >= tcpb_maxSgPages*tcpb_bytesPerSgPage) {
+							xmit_offset = 0;
+						}
+					}
+				}
 			}
 
 		}
