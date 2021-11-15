@@ -11,12 +11,13 @@
 #include <sys/uio.h>
 #include <arpa/inet.h>
 #include <netinet/in.h> 
+#include <errno.h>
 #include "smartdac_regs.h"
  
 #define BUFLEN 512
 #define PORT_LOCAL 	8887
 #define MAX_CLIENTS 1
-#define NUM_PACKETS_TIMEOUT 100000
+#define NUM_PACKETS_TIMEOUT 200 //This is not robust to sample rate variations
  
 //Mapped memory definitions
 //OCM (sampled values)
@@ -24,9 +25,9 @@
 #define OCM_MAPSIZE 			(64*1024)				
 //AXI Registers
 #define REGS_BASEADDR 			0x80000000
-#define REGS_MAPSIZE 			(4*1024)
+#define REGS_MAPSIZE 			(0x1D0050)
 
-#define TCP_BUF_SIZE 131072
+#define TCP_BUF_SIZE 4194304
 #define TCP_MAX_XMIT TCP_BUF_SIZE
 
 int main(void) {
@@ -78,8 +79,8 @@ int main(void) {
 	uint32_t tcpb_bytesPerSample;
 	uint32_t tcpb_bytesPerSgPage;
 
-	uint32_t timestamp;
-	uint32_t prevTimestamp;
+	uint64_t timestamp;
+	uint64_t prevTimestamp;
 	
 	int i, j, k;
 	
@@ -93,8 +94,7 @@ int main(void) {
 	struct iovec iovecs[4*4096]; // max is SG_PAGE_LENGTH/4
 	struct iovec* piovecs[4];
 	
-	int fd_buf;
-	uint16_t memory_buffer[TCP_BUF_SIZE];
+	uint8_t memory_buffer[TCP_BUF_SIZE];
 
 	// open /dev/mem for mapping
 	fd = open("/dev/mem", O_RDWR|O_SYNC);
@@ -118,15 +118,24 @@ int main(void) {
 	}
 	
 	// open memory buffer
-	fd_buf = fmemopen(memory_buffer, 262144, "w");
+	//fd_buf = fmemopen(memory_buffer, 262144, "w");
+	//if (fd_buf == NULL) {
+	//	printf("Failed to open TCP buffer, errno = %d\n", errno);
+	//}
 
 	// get SV buffer parameters
 	SV_BUF_ADDRESS 	= *(volatile uint32_t*)(pregs+NETSCOPEBA_OFFSET);
 	SV_BUF_PAGELEN 	= *(volatile uint32_t*)(pregs+NETSCOPEPL_OFFSET);
 	SV_BUF_LENGTH	= *(volatile uint32_t*)(pregs+NETSCOPEBL_OFFSET);
-	SV_BUF_DATANUM	= *(volatile uint32_t*)(pregs+NETSCOPEDL_OFFSET) + 4;	// 4 words in timestamp
+	SV_BUF_DATANUM	= *(volatile uint32_t*)(pregs+NETSCOPEDL_OFFSET);	// 4 words in timestamp
 	SV_BUF_TIMEOFF	= *(volatile uint32_t*)(pregs+NETSCOPETO_OFFSET);
-	
+	printf("Loaded SV buffer details from PL:\n");
+	printf("      Base address: 0x%08X\n", SV_BUF_ADDRESS);
+	printf("     Buffer length: 0x%08X\n", SV_BUF_LENGTH);
+	printf("       Page length: 0x%08X\n", SV_BUF_PAGELEN);
+	printf("  Timestamp offset: 0x%08X\n", SV_BUF_TIMEOFF);
+	printf("      Signal count: %d\n", SV_BUF_DATANUM);
+
 	// set SG page parameters
 	SG_PAGE_NUM = 4;
 	SG_PAGE_LENGTH = SV_BUF_LENGTH/SG_PAGE_NUM;
@@ -164,32 +173,41 @@ int main(void) {
 		do {
 			ioctl(client, FIONREAD, &bytesAvailable);
 		} while (bytesAvailable < 14);
-		printf("DONE.");
+		printf("DONE.\n\r");
 		
 		//Wait for header: 'NS' + sv_mask (64bit) + sv_window_len (32 bit)
 		nbytes = read(client, rxbuf, 14);
-		if (nbytes < 14) break;
-		if (rxbuf[0] != 'N') break;
-		if (rxbuf[1] != 'S') break;
-		printf("Received netscope header.\n");
+		/*
+		for (i = 0; i < 14; i++) {
+			printf("[%02d] 0x%0X\n\r", i, rxbuf[i]);
+		}
+		*/
+		if ((nbytes < 14) || (rxbuf[0] != 0x53) || (rxbuf[1] != 0x56)) {
+			close(client);
+			printf("Invalid header. Rejecting client.\n\r");
+			continue;
+		}
+
+
+		printf("Received netscope header:\n");
 		
 		//Get SV mask
-		sv_mask = rxbuf[2];
-		sv_mask = (sv_mask<<8) | rxbuf[3];
-		sv_mask = (sv_mask<<8) | rxbuf[4];
-		sv_mask = (sv_mask<<8) | rxbuf[5];
-		sv_mask = (sv_mask<<8) | rxbuf[6];
-		sv_mask = (sv_mask<<8) | rxbuf[7];
+		sv_mask = rxbuf[9];
 		sv_mask = (sv_mask<<8) | rxbuf[8];
-		sv_mask = (sv_mask<<8) | rxbuf[9];
-		printf("SV bitmask is 0x%llX.\n", sv_mask);
+		sv_mask = (sv_mask<<8) | rxbuf[7];
+		sv_mask = (sv_mask<<8) | rxbuf[6];
+		sv_mask = (sv_mask<<8) | rxbuf[5];
+		sv_mask = (sv_mask<<8) | rxbuf[4];
+		sv_mask = (sv_mask<<8) | rxbuf[3];
+		sv_mask = (sv_mask<<8) | rxbuf[2];
+		printf("  SV bitmask is 0x%llX.\n", sv_mask);
 		
 		//Get sample window length
-		sv_window_len = rxbuf[10];
-		sv_window_len = (sv_window_len<<8) | rxbuf[11];
+		sv_window_len = rxbuf[13];
 		sv_window_len = (sv_window_len<<8) | rxbuf[12];
-		sv_window_len = (sv_window_len<<8) | rxbuf[13];
-		printf("Window length is %lld.\n", sv_window_len);
+		sv_window_len = (sv_window_len<<8) | rxbuf[11];
+		sv_window_len = (sv_window_len<<8) | rxbuf[10];
+		printf("  Window length is %lld.\n", sv_window_len);
 		
 		//Analyse sv_mask
 		sv_mask_z2o = sv_mask&(sv_mask^(sv_mask<<1));		//zero-to-one transitions
@@ -199,21 +217,39 @@ int main(void) {
 		sv_mask_segs = 0;
 		sv_mask_num = 0;
 		for (i = 0; i < SV_BUF_DATANUM; i++) {
-			if (sv_mask_z2o&(1<<i)) {
-				sv_mask_bi[j] = i;
-				sv_mask_bl[j] = 1;
-				sv_mask_segs++;
-			} else if (sv_mask_o2z&(1<<i)) {
-				sv_mask_num += sv_mask_bl[j];
-				j++;
+			if (sv_mask_z2o&((uint64_t)1<<i)) {
+				//New segment
+				sv_mask_bi[j] = i;	//Save start index
+				sv_mask_bl[j] = 1;	//Set segment length to one
+				sv_mask_segs++;		//Incrment segment count
+			} else if (sv_mask_o2z&((uint64_t)1<<i)) {
+				//End of segment
+				sv_mask_num += sv_mask_bl[j]; //Increment signal count by segment length
+				j++; //New segment
 			} else {
-				sv_mask_bl[j] = 1;
+				sv_mask_bl[j]++;
+				if (i == (SV_BUF_DATANUM-1)) {
+					if (sv_mask&((uint64_t)1<<i)) {
+						//Last valid signal so finalise signal count
+						sv_mask_num += sv_mask_bl[j];
+					}
+				}
 			}
 		}
 
 		tcpb_bytesPerSample = 2*sv_mask_num;
 		tcpb_bytesPerSgPage = tcpb_bytesPerSample*SG_PAGE_NSAMPLES;
 		tcpb_maxSgPages = TCP_BUF_SIZE/tcpb_bytesPerSgPage;
+
+		printf("Analysis of memory segments:\n\r");
+		printf("  Segments: %d\n", sv_mask_segs);
+		for (i = 0; i < sv_mask_segs; i++) {
+			printf("  [%d] %d signal(s)\n", sv_mask_bi[i], sv_mask_bl[i]);
+		}
+
+		printf("  TCP bytes per sample:    %d\n", tcpb_bytesPerSample);
+		printf("  TCP bytes per SG page:   %d\n", tcpb_bytesPerSgPage);
+		printf("  TCP buffer max SG pages: %d\n", tcpb_maxSgPages);
 
 		//Generate iovecs for all pages
 		for (i = 0; i < SG_PAGE_NUM; i++) {
@@ -226,6 +262,8 @@ int main(void) {
 			}
 		}
 
+
+
 		isAlive = NUM_PACKETS_TIMEOUT;
 
 		// reset sample pointers
@@ -233,17 +271,63 @@ int main(void) {
 		pTimestamp = SV_BUF_TIMEOFF;
 		sgPageCount = 0;
 		
-		timestamp = *(volatile uint32_t*)(pocm+pTimestamp);
-		prevTimestamp = timestamp+1000000; 	// allow some time to sync
-			
+		/*
+		j = tcpb_bytesPerSgPage*sgPageCount;
+		for (i = 0; i < SG_PAGE_NSAMPLES*sv_mask_segs; i++) {
+			printf("[%04d] Dest: 0x%08X, Src: 0x%08X, Len: 0x%02X\n", i, j, (uint32_t)piovecs[0][i].iov_base, piovecs[0][i].iov_len);
+			j+=piovecs[0][i].iov_len;
+		}
+		*/
+
+		xmit_length = 0;
+		xmit_inProgress = 0;
+		xmit_isPending = 0;
+
+		timestamp = *(volatile uint64_t*)(pocm+pTimestamp);
+		prevTimestamp = timestamp+0x1000000; 	// allow some time to sync, TODO: Fix this to be robust to sample rate
+		pTimestamp += SG_PAGE_LENGTH;
+
+		/*
+		printf("First timestamp: 0x%016llX\n", timestamp);
+
+		for (i = 0; i < 0x40; i+=4) {
+			printf("[0x%02X] 0x%08X\n", i, *(volatile uint32_t*)(pocm+i));
+		}
+		*/
+
 		while (isAlive) {
 			
-			timestamp = *(volatile uint32_t*)(pocm+pTimestamp);
+			timestamp = *(volatile uint64_t*)(pocm+pTimestamp);
 			
 			if (timestamp > prevTimestamp) {
 				
-				pwritev(fd_buf,piovecs[pPage&0x03],SG_PAGE_NSAMPLES*sv_mask_segs,tcpb_bytesPerSgPage*sgPageCount);
+				//printf("Timestamp: 0x%08X\n", timestamp);
+
+				/*
+				for (i = 0; i < SG_PAGE_NSAMPLES*sv_mask_segs; i++) {
+					printf("[%02d] 0x%04X\n", i, *(uint16_t *) (piovecs[pPage&0x03][i].iov_base));
+				}
+				*/
+
+				//nbytes = fseek(fd_buf,tcpb_bytesPerSgPage*sgPageCount,SEEK_SET);
+				//printf("seek returned: %d, Error: %d\n", nbytes, errno);
+				//nbytes = pwritev(fileno(fd_buf),piovecs[pPage&0x03],SG_PAGE_NSAMPLES*sv_mask_segs,tcpb_bytesPerSgPage*sgPageCount);
+				//printf("pwritev Returned: %d, Error: %d\n", nbytes, errno);
+
+				j = tcpb_bytesPerSgPage*sgPageCount;
+				for (i = 0; i < SG_PAGE_NSAMPLES*sv_mask_segs; i++) {
+					//printf("[%04d] Dest: 0x%08X, Src: 0x%08X, Len: 0x%02X\n", i, j, (uint32_t)piovecs[pPage&0x03][i].iov_base, piovecs[pPage&0x03][i].iov_len);
+					memcpy(memory_buffer+j, piovecs[pPage&0x03][i].iov_base, piovecs[pPage&0x03][i].iov_len);
+					//printf("src = %04X, dst = %04X\n", *(uint16_t *)(piovecs[pPage&0x03][i].iov_base+2), *(uint16_t *)(memory_buffer+j+2));
+					j+=piovecs[pPage&0x03][i].iov_len;
+				}
+				//for (i = tcpb_bytesPerSgPage*sgPageCount; i < tcpb_bytesPerSgPage*(sgPageCount+1); i++) {
+				//	printf("[%04X] %02X\n", i, memory_buffer[i]);
+				//}
+
+
 				pTimestamp += SG_PAGE_LENGTH;
+				if (pTimestamp > SV_BUF_LENGTH) pTimestamp -= SV_BUF_LENGTH;
 				pPage++;
 				sgPageCount++;
 				
@@ -289,7 +373,7 @@ int main(void) {
 					xmit_maxBytes = xmit_length;
 				}
 				nbytes = send(client, memory_buffer+xmit_offset, xmit_maxBytes, 0);
-				printf("XMIT: Sent %d bytes beginning offset 0x%X.\n", nbytes, xmit_offset);
+				//printf("XMIT: Sent %d bytes beginning offset 0x%X.\n", nbytes, xmit_offset);
 				if (nbytes < 0) {
 					//Error
 					isAlive = 0;
