@@ -18,6 +18,7 @@
 #define PORT_LOCAL 	8887
 #define MAX_CLIENTS 1
 #define NUM_PACKETS_TIMEOUT 200 //This is not robust to sample rate variations
+#define KEEPALIVE_TIMEOUT 1000000000 //5s assuming 5ns clock
  
 //Mapped memory definitions
 //OCM (sampled values)
@@ -44,11 +45,18 @@ int main(void) {
 	uint64_t sv_mask;
 	uint64_t sv_window_len;
 	
-	uint8_t xmit_inProgress = 0;
-	uint8_t xmit_isPending = 0;
+	uint32_t tcpb_unreadSamples = 0;
+	uint32_t tcpb_pOldestUnreadSample = 0;
+
+	//uint8_t xmit_inProgress = 0;
+	//uint8_t xmit_isPending = 0;
+	uint32_t xmit_status;
 	uint32_t xmit_offset;
 	uint32_t xmit_length;
 	uint32_t xmit_maxBytes;
+	//uint32_t xmit_holdoff = 0;
+
+	uint64_t timeout;
 
 	int result;
 
@@ -59,13 +67,11 @@ int main(void) {
 	int nbytes;
 
 	// socket tx/rx buffers
-	//uint8_t txbuf[BUFLEN];
 	uint8_t rxbuf[BUFLEN];
 
 	// flow control management
 	int bytesAvailable;
-	uint32_t isAlive;
-
+	//uint32_t isAlive;
 	
 	// OCM descriptors
 	int fd;
@@ -116,12 +122,6 @@ int main(void) {
 		printf("ERROR: Failed to map REGS to memory.\n");
 		return -1;
 	}
-	
-	// open memory buffer
-	//fd_buf = fmemopen(memory_buffer, 262144, "w");
-	//if (fd_buf == NULL) {
-	//	printf("Failed to open TCP buffer, errno = %d\n", errno);
-	//}
 
 	// get SV buffer parameters
 	SV_BUF_ADDRESS 	= *(volatile uint32_t*)(pregs+NETSCOPEBA_OFFSET);
@@ -169,26 +169,36 @@ int main(void) {
 		client = accept(tcps, (struct sockaddr *) &clientAddr, (socklen_t*) &slen);
 		printf("Netscope client connected.\n\r");
 
+		//Wait for header from client
+		//Timeout after 10 seconds
 		printf("Waiting for 14 byte header from client...");
-		do {
+		for(i = 10; i; --i) {
 			ioctl(client, FIONREAD, &bytesAvailable);
-		} while (bytesAvailable < 14);
+			if (bytesAvailable >= 14) {
+				break;
+			}
+			sleep(1);
+		}
+		//If i=0 we timed out so reject client connection
+		if (!i) {
+			close(client);
+			printf("TIMED OUT. Rejecting client.\n");
+			continue;
+		}
+		//If we got here there are at least 14 bytes in buffer
 		printf("DONE.\n\r");
 		
-		//Wait for header: 'NS' + sv_mask (64bit) + sv_window_len (32 bit)
+		//Rx header: 'NS' + sv_mask (64bit) + sv_window_len (32 bit)
 		nbytes = read(client, rxbuf, 14);
-		/*
-		for (i = 0; i < 14; i++) {
-			printf("[%02d] 0x%0X\n\r", i, rxbuf[i]);
-		}
-		*/
+
+		//Check header validity
 		if ((nbytes < 14) || (rxbuf[0] != 0x53) || (rxbuf[1] != 0x56)) {
 			close(client);
 			printf("Invalid header. Rejecting client.\n\r");
 			continue;
 		}
 
-
+		//Print config details from header
 		printf("Received netscope header:\n");
 		
 		//Get SV mask
@@ -213,9 +223,12 @@ int main(void) {
 		sv_mask_z2o = sv_mask&(sv_mask^(sv_mask<<1));		//zero-to-one transitions
 		sv_mask_o2z = (~sv_mask)&(sv_mask^(sv_mask<<1));   	//one-to-zero transitions
 
-		j = 0; //segment counter
-		sv_mask_segs = 0;
-		sv_mask_num = 0;
+		//This code determines the minimum number of contiguous segments of data
+		//within a sample of signals. This is subsequently used to calculate
+		//iovecs for vectored I/O.
+		j = 0; //current segment index
+		sv_mask_segs = 0; //number or segments
+		sv_mask_num = 0; //number of enabled signals
 		for (i = 0; i < SV_BUF_DATANUM; i++) {
 			if (sv_mask_z2o&((uint64_t)1<<i)) {
 				//New segment
@@ -237,10 +250,12 @@ int main(void) {
 			}
 		}
 
-		tcpb_bytesPerSample = 2*sv_mask_num;
-		tcpb_bytesPerSgPage = tcpb_bytesPerSample*SG_PAGE_NSAMPLES;
-		tcpb_maxSgPages = TCP_BUF_SIZE/tcpb_bytesPerSgPage;
+		//Calculation of TCP-buffer-perspective lengths
+		tcpb_bytesPerSample = 2*sv_mask_num;						//Bytes per sample
+		tcpb_bytesPerSgPage = tcpb_bytesPerSample*SG_PAGE_NSAMPLES; //Bytes per page written into buffer
+		tcpb_maxSgPages = TCP_BUF_SIZE/tcpb_bytesPerSgPage;			//Number of whole pages in buffer
 
+		//Print segment analysis and TCP buffer parameters
 		printf("Analysis of memory segments:\n\r");
 		printf("  Segments: %d\n", sv_mask_segs);
 		for (i = 0; i < sv_mask_segs; i++) {
@@ -251,7 +266,7 @@ int main(void) {
 		printf("  TCP bytes per SG page:   %d\n", tcpb_bytesPerSgPage);
 		printf("  TCP buffer max SG pages: %d\n", tcpb_maxSgPages);
 
-		//Generate iovecs for all pages
+		//Generate iovecs for all pages in OCM buffer
 		for (i = 0; i < SG_PAGE_NUM; i++) {
 			piovecs[i] = iovecs+(i*SG_PAGE_NSAMPLES*sv_mask_segs);
 			for (j = 0; j < SG_PAGE_NSAMPLES; j++) {
@@ -263,142 +278,116 @@ int main(void) {
 		}
 
 
-
-		isAlive = NUM_PACKETS_TIMEOUT;
-
 		// reset sample pointers
 		pPage = 0;
 		pTimestamp = SV_BUF_TIMEOFF;
 		sgPageCount = 0;
-		
-		/*
-		j = tcpb_bytesPerSgPage*sgPageCount;
-		for (i = 0; i < SG_PAGE_NSAMPLES*sv_mask_segs; i++) {
-			printf("[%04d] Dest: 0x%08X, Src: 0x%08X, Len: 0x%02X\n", i, j, (uint32_t)piovecs[0][i].iov_base, piovecs[0][i].iov_len);
-			j+=piovecs[0][i].iov_len;
-		}
-		*/
+		tcpb_unreadSamples = 0;
+		tcpb_pOldestUnreadSample = 0;
 
+		xmit_status = 0;
 		xmit_length = 0;
-		xmit_inProgress = 0;
-		xmit_isPending = 0;
 
 		timestamp = *(volatile uint64_t*)(pocm+pTimestamp);
 		prevTimestamp = timestamp+0x1000000; 	// allow some time to sync, TODO: Fix this to be robust to sample rate
-		pTimestamp += SG_PAGE_LENGTH;
+		pTimestamp += SG_PAGE_LENGTH;			// pTimestamp is advanced by one OCM page compared with pPage
+		timeout = timestamp+KEEPALIVE_TIMEOUT;
 
-		/*
-		printf("First timestamp: 0x%016llX\n", timestamp);
-
-		for (i = 0; i < 0x40; i+=4) {
-			printf("[0x%02X] 0x%08X\n", i, *(volatile uint32_t*)(pocm+i));
-		}
-		*/
-
-		while (isAlive) {
+		while (1) {
 			
+			//Get timestamp
 			timestamp = *(volatile uint64_t*)(pocm+pTimestamp);
 			
+			//Wait for new page to be written to OCM
+			// BEGIN NEW OCM PAGE
 			if (timestamp > prevTimestamp) {
-				
-				//printf("Timestamp: 0x%08X\n", timestamp);
 
-				/*
-				for (i = 0; i < SG_PAGE_NSAMPLES*sv_mask_segs; i++) {
-					printf("[%02d] 0x%04X\n", i, *(uint16_t *) (piovecs[pPage&0x03][i].iov_base));
-				}
-				*/
-
-				//nbytes = fseek(fd_buf,tcpb_bytesPerSgPage*sgPageCount,SEEK_SET);
-				//printf("seek returned: %d, Error: %d\n", nbytes, errno);
-				//nbytes = pwritev(fileno(fd_buf),piovecs[pPage&0x03],SG_PAGE_NSAMPLES*sv_mask_segs,tcpb_bytesPerSgPage*sgPageCount);
-				//printf("pwritev Returned: %d, Error: %d\n", nbytes, errno);
-
+				//Copy OCM page into TCP buffer
 				j = tcpb_bytesPerSgPage*sgPageCount;
 				for (i = 0; i < SG_PAGE_NSAMPLES*sv_mask_segs; i++) {
-					//printf("[%04d] Dest: 0x%08X, Src: 0x%08X, Len: 0x%02X\n", i, j, (uint32_t)piovecs[pPage&0x03][i].iov_base, piovecs[pPage&0x03][i].iov_len);
-					memcpy(memory_buffer+j, piovecs[pPage&0x03][i].iov_base, piovecs[pPage&0x03][i].iov_len);
-					//printf("src = %04X, dst = %04X\n", *(uint16_t *)(piovecs[pPage&0x03][i].iov_base+2), *(uint16_t *)(memory_buffer+j+2));
-					j+=piovecs[pPage&0x03][i].iov_len;
+					memcpy(memory_buffer+j, piovecs[pPage][i].iov_base, piovecs[pPage][i].iov_len);
+					j+=piovecs[pPage][i].iov_len;
 				}
-				//for (i = tcpb_bytesPerSgPage*sgPageCount; i < tcpb_bytesPerSgPage*(sgPageCount+1); i++) {
-				//	printf("[%04X] %02X\n", i, memory_buffer[i]);
-				//}
-
-
-				pTimestamp += SG_PAGE_LENGTH;
-				if (pTimestamp > SV_BUF_LENGTH) pTimestamp -= SV_BUF_LENGTH;
-				pPage++;
-				sgPageCount++;
 				
-				//Reset buffer offset if we will overflow on next write
-				if (sgPageCount >= tcpb_maxSgPages) {
-					sgPageCount = 0;
+				tcpb_unreadSamples += SG_PAGE_NSAMPLES; //Number of samples we just wrote into TCP buffer
+				if (tcpb_unreadSamples > tcpb_maxSgPages*SG_PAGE_NSAMPLES) {
+					// We overwrote some old data
+					tcpb_pOldestUnreadSample += (tcpb_unreadSamples-(tcpb_maxSgPages*SG_PAGE_NSAMPLES));
+					tcpb_pOldestUnreadSample = tcpb_pOldestUnreadSample%(tcpb_maxSgPages*SG_PAGE_NSAMPLES);
+					tcpb_unreadSamples = tcpb_maxSgPages*SG_PAGE_NSAMPLES; //max buffered samples
 				}
 
-				ioctl(client, FIONREAD, &bytesAvailable);
-				if (bytesAvailable > 0) {
-					isAlive = NUM_PACKETS_TIMEOUT;
-					j = read(client, rxbuf, BUFLEN);
-					for (i = 0; i < j; i++) {
-						if (rxbuf[i]) {
-							if (xmit_inProgress) {
-								xmit_isPending = 1;
-							} else {
-								xmit_inProgress = 1;
-								xmit_length = tcpb_bytesPerSample*sv_window_len;
-								if (tcpb_bytesPerSgPage*sgPageCount < xmit_length) {
-									xmit_offset = tcpb_bytesPerSgPage*(tcpb_maxSgPages+sgPageCount)-xmit_length;
-								} else {
-									xmit_offset = tcpb_bytesPerSgPage*sgPageCount - xmit_length;
-								}
-							}
-							break;
-						}
-					}
-				}
+				//Advance timestamp and page pointers (OCM)
+				pTimestamp += SG_PAGE_LENGTH;	//Advance timestamp pointer to next OCM page
+				if (pTimestamp > SV_BUF_LENGTH) pTimestamp -= SV_BUF_LENGTH; //If OCM overflow, reset
+				pPage = (pPage+1)%SG_PAGE_NUM;	//Advance OCM page counter
+
+				//Advance page counter (TCP buffer)
+				sgPageCount++;
+				if (sgPageCount >= tcpb_maxSgPages) sgPageCount = 0; //If buffer overflow, reset
 		
 				prevTimestamp = timestamp;
+			} // END NEW OCM PAGE
 
-				--isAlive;
-			}
-
-			if (xmit_length > 0) {
-
-				if (xmit_offset+xmit_length > tcpb_maxSgPages*tcpb_bytesPerSgPage) {
-					xmit_maxBytes = tcpb_maxSgPages*tcpb_bytesPerSgPage - xmit_offset;
-				} else if (xmit_length > TCP_MAX_XMIT) {
-					xmit_maxBytes = TCP_MAX_XMIT;
-				} else {
-					xmit_maxBytes = xmit_length;
-				}
-				nbytes = send(client, memory_buffer+xmit_offset, xmit_maxBytes, 0);
-				//printf("XMIT: Sent %d bytes beginning offset 0x%X.\n", nbytes, xmit_offset);
-				if (nbytes < 0) {
-					//Error
-					isAlive = 0;
-				} else {
-					xmit_offset += nbytes;
-					xmit_length -= nbytes;
-					if (!xmit_length) {
-						if (xmit_isPending) {
+			//BEGIN TCP RX HANDLING
+			ioctl(client, FIONREAD, &bytesAvailable);
+			if (bytesAvailable > 0) {
+				timeout = timestamp+KEEPALIVE_TIMEOUT; //Update timeout counter
+				//Rx data
+				nbytes = read(client, rxbuf, BUFLEN);
+				for (i = 0; i < nbytes; i++) {
+					//No further action for keepalive bytes (0x00)
+					if (rxbuf[i]) {
+						//Increment pending window count
+						if (!(xmit_status++)) {
+							//New xmit
 							xmit_length = tcpb_bytesPerSample*sv_window_len;
-							if (tcpb_bytesPerSgPage*sgPageCount < xmit_length) {
-								xmit_offset = tcpb_bytesPerSgPage*(tcpb_maxSgPages+sgPageCount)-xmit_length;
-							} else {
-								xmit_offset = tcpb_bytesPerSgPage*sgPageCount - xmit_length;
-							}
-						} else {
-							xmit_inProgress = 0;
-						}
-					} else {
-						if (xmit_offset >= tcpb_maxSgPages*tcpb_bytesPerSgPage) {
-							xmit_offset = 0;
+							xmit_offset = tcpb_pOldestUnreadSample*tcpb_bytesPerSample;
 						}
 					}
 				}
+			} else if (timestamp > timeout) {
+				printf("Client timed out. Disconnecting.\n");
+				break;
 			}
+			//END TCP RX HANDLING
 
+			//BEGIN TCP TX HANDLING
+			if (xmit_status && tcpb_unreadSamples) {
+				//We need to send data, and have data to send
+
+				//Calculate maximum bytes for this xmit
+				xmit_maxBytes = xmit_length;
+				if (xmit_maxBytes > tcpb_unreadSamples*tcpb_bytesPerSample) xmit_maxBytes = tcpb_unreadSamples*tcpb_bytesPerSample; //Not all data available
+				if (xmit_offset+xmit_maxBytes > tcpb_maxSgPages*tcpb_bytesPerSgPage) xmit_maxBytes = tcpb_maxSgPages*tcpb_bytesPerSgPage - xmit_offset; //Would overflow
+				if (xmit_maxBytes > TCP_MAX_XMIT) xmit_maxBytes = TCP_MAX_XMIT; //More data than max send permitted
+
+				//Xmit
+				nbytes = send(client, memory_buffer+xmit_offset, xmit_maxBytes, 0);
+				//printf("XMIT: Sent %d bytes beginning offset 0x%X.\n", nbytes, xmit_offset);
+
+				if (nbytes < 0) {
+					//Error
+					printf("Error sending data to client. Disconnecting client.\n");
+					break;
+				} else {
+					xmit_offset += nbytes;
+					xmit_offset = xmit_offset%(tcpb_maxSgPages*tcpb_bytesPerSgPage); //overflow
+					xmit_length -= nbytes;
+					//TODO: These three line might be fragile?, could possibly split a sample
+					tcpb_unreadSamples -= nbytes/tcpb_bytesPerSample;
+					tcpb_pOldestUnreadSample += nbytes/tcpb_bytesPerSample;
+					tcpb_pOldestUnreadSample = tcpb_pOldestUnreadSample%(tcpb_maxSgPages*SG_PAGE_NSAMPLES); //overflow
+					//Completed window?
+					if (!xmit_length) {
+						if(--xmit_status) {
+							//New xmit
+							xmit_length = tcpb_bytesPerSample*sv_window_len;
+							xmit_offset = tcpb_pOldestUnreadSample*tcpb_bytesPerSample;
+						}
+					}
+				}
+			} //END TCP TX HANDLING
 		}
 
 		printf("Netscope client disconnected.\n\r");
