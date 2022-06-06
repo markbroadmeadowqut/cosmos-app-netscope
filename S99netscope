@@ -3,7 +3,7 @@ DAEMON=/usr/bin/netscope
 start ()
 {
 	echo " Executing netscope..."
-	start-stop-daemon -S -o -x $DAEMON
+	start-stop-daemon -S -o -b -x $DAEMON
 }
 stop ()
 {
