@@ -97,6 +97,10 @@ int main(void) {
 	uint8_t sv_mask_segs;
 	uint8_t sv_mask_num;
 	
+	//decimation
+	uint8_t deci_log2;
+	uint32_t deci;
+
 	struct iovec iovecs[4*4096]; // max is SG_PAGE_LENGTH/4
 	struct iovec* piovecs[4];
 	
@@ -171,10 +175,10 @@ int main(void) {
 
 		//Wait for header from client
 		//Timeout after 10 seconds
-		printf("Waiting for 14 byte header from client...");
+		printf("Waiting for 15 byte header from client...");
 		for(i = 10; i; --i) {
 			ioctl(client, FIONREAD, &bytesAvailable);
-			if (bytesAvailable >= 14) {
+			if (bytesAvailable >= 15) {
 				break;
 			}
 			sleep(1);
@@ -185,14 +189,14 @@ int main(void) {
 			printf("TIMED OUT. Rejecting client.\n");
 			continue;
 		}
-		//If we got here there are at least 14 bytes in buffer
+		//If we got here there are at least 15 bytes in buffer
 		printf("DONE.\n\r");
 		
-		//Rx header: 'NS' + sv_mask (64bit) + sv_window_len (32 bit)
-		nbytes = read(client, rxbuf, 14);
+		//Rx header: 'NS' + sv_mask (64bit) + sv_window_len (32 bit) + decimation_log2 (8-bit)
+		nbytes = read(client, rxbuf, 15);
 
 		//Check header validity
-		if ((nbytes < 14) || (rxbuf[0] != 0x53) || (rxbuf[1] != 0x56)) {
+		if ((nbytes < 15) || (rxbuf[0] != 0x53) || (rxbuf[1] != 0x56)) {
 			close(client);
 			printf("Invalid header. Rejecting client.\n\r");
 			continue;
@@ -219,6 +223,11 @@ int main(void) {
 		sv_window_len = (sv_window_len<<8) | rxbuf[10];
 		printf("  Window length is %lld.\n", sv_window_len);
 		
+		//Get decimation settings
+		deci_log2 = rxbuf[14];
+		deci = 1UL << deci_log2;
+		printf("  Decimation interval is %u.\n", deci);
+
 		//Analyse sv_mask
 		sv_mask_z2o = sv_mask&(sv_mask^(sv_mask<<1));		//zero-to-one transitions
 		sv_mask_o2z = (~sv_mask)&(sv_mask^(sv_mask<<1));   	//one-to-zero transitions
@@ -252,7 +261,7 @@ int main(void) {
 
 		//Calculation of TCP-buffer-perspective lengths
 		tcpb_bytesPerSample = 2*sv_mask_num;						//Bytes per sample
-		tcpb_bytesPerSgPage = tcpb_bytesPerSample*SG_PAGE_NSAMPLES; //Bytes per page written into buffer
+		tcpb_bytesPerSgPage = tcpb_bytesPerSample*(SG_PAGE_NSAMPLES>>deci_log2); //Bytes per page written into buffer
 		tcpb_maxSgPages = TCP_BUF_SIZE/tcpb_bytesPerSgPage;			//Number of whole pages in buffer
 
 		//Print segment analysis and TCP buffer parameters
@@ -268,11 +277,11 @@ int main(void) {
 
 		//Generate iovecs for all pages in OCM buffer
 		for (i = 0; i < SG_PAGE_NUM; i++) {
-			piovecs[i] = iovecs+(i*SG_PAGE_NSAMPLES*sv_mask_segs);
-			for (j = 0; j < SG_PAGE_NSAMPLES; j++) {
+			piovecs[i] = iovecs+(i*(SG_PAGE_NSAMPLES>>deci_log2)*sv_mask_segs);
+			for (j = 0; j < SG_PAGE_NSAMPLES; j += deci) {
 				for (k = 0; k < sv_mask_segs; k++) {
-					iovecs[(i*SG_PAGE_NSAMPLES*sv_mask_segs) + (j*sv_mask_segs) + k].iov_base = &pocm[(i*SG_PAGE_LENGTH) + (j*SV_BUF_PAGELEN) + (2*sv_mask_bi[k])];
-					iovecs[(i*SG_PAGE_NSAMPLES*sv_mask_segs) + (j*sv_mask_segs) + k].iov_len = 2*sv_mask_bl[k]; // 2 bytes per SV
+					iovecs[(i*(SG_PAGE_NSAMPLES>>deci_log2)*sv_mask_segs) + ((j>>deci_log2)*sv_mask_segs) + k].iov_base = &pocm[(i*SG_PAGE_LENGTH) + (j*SV_BUF_PAGELEN) + (2*sv_mask_bi[k])];
+					iovecs[(i*(SG_PAGE_NSAMPLES>>deci_log2)*sv_mask_segs) + ((j>>deci_log2)*sv_mask_segs) + k].iov_len = 2*sv_mask_bl[k]; // 2 bytes per SV
 				}
 			}
 		}
@@ -304,17 +313,17 @@ int main(void) {
 
 				//Copy OCM page into TCP buffer
 				j = tcpb_bytesPerSgPage*sgPageCount;
-				for (i = 0; i < SG_PAGE_NSAMPLES*sv_mask_segs; i++) {
+				for (i = 0; i < (SG_PAGE_NSAMPLES>>deci_log2)*sv_mask_segs; i++) {
 					memcpy(memory_buffer+j, piovecs[pPage][i].iov_base, piovecs[pPage][i].iov_len);
 					j+=piovecs[pPage][i].iov_len;
 				}
 				
-				tcpb_unreadSamples += SG_PAGE_NSAMPLES; //Number of samples we just wrote into TCP buffer
-				if (tcpb_unreadSamples > tcpb_maxSgPages*SG_PAGE_NSAMPLES) {
+				tcpb_unreadSamples += (SG_PAGE_NSAMPLES>>deci_log2); //Number of samples we just wrote into TCP buffer
+				if (tcpb_unreadSamples > tcpb_maxSgPages*(SG_PAGE_NSAMPLES>>deci_log2)) {
 					// We overwrote some old data
-					tcpb_pOldestUnreadSample += (tcpb_unreadSamples-(tcpb_maxSgPages*SG_PAGE_NSAMPLES));
-					tcpb_pOldestUnreadSample = tcpb_pOldestUnreadSample%(tcpb_maxSgPages*SG_PAGE_NSAMPLES);
-					tcpb_unreadSamples = tcpb_maxSgPages*SG_PAGE_NSAMPLES; //max buffered samples
+					tcpb_pOldestUnreadSample += (tcpb_unreadSamples-(tcpb_maxSgPages*(SG_PAGE_NSAMPLES>>deci_log2)));
+					tcpb_pOldestUnreadSample = tcpb_pOldestUnreadSample%(tcpb_maxSgPages*(SG_PAGE_NSAMPLES>>deci_log2));
+					tcpb_unreadSamples = tcpb_maxSgPages*(SG_PAGE_NSAMPLES>>deci_log2); //max buffered samples
 				}
 
 				//Advance timestamp and page pointers (OCM)
@@ -377,7 +386,7 @@ int main(void) {
 					//TODO: These three line might be fragile?, could possibly split a sample
 					tcpb_unreadSamples -= nbytes/tcpb_bytesPerSample;
 					tcpb_pOldestUnreadSample += nbytes/tcpb_bytesPerSample;
-					tcpb_pOldestUnreadSample = tcpb_pOldestUnreadSample%(tcpb_maxSgPages*SG_PAGE_NSAMPLES); //overflow
+					tcpb_pOldestUnreadSample = tcpb_pOldestUnreadSample%(tcpb_maxSgPages*(SG_PAGE_NSAMPLES>>deci_log2)); //overflow
 					//Completed window?
 					if (!xmit_length) {
 						if(--xmit_status) {

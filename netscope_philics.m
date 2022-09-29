@@ -6,8 +6,10 @@ remotePort = 8887;                % server port (default 8887)
 
 % Application parameters
 app = struct;
-app.samples = 1024;     % Windows length in sampels for each capture
-app.samplerate = 20e3;  % Sample rate of data (for time base scaling)
+app.samples = 1024;      % Windows length in samples for each capture
+app.samplerate = 1e6;    % Sample rate of data (for time base scaling)
+app.decimation = 0;      % Decimation factor for sample rate (log 2)
+app.timebase = 1e-3;     % Width of scope window in seconds
 
 % SIGNAL DEFINITIONS
 % You may define here 1+ signals to be sampled from the remote controller.
@@ -18,20 +20,20 @@ app.samplerate = 20e3;  % Sample rate of data (for time base scaling)
 % value = (typecast(signal, type) + offset)*scale;
 signals = struct;
 
-signals(1).name = 'Time (low)'; % Name used in scope legend
+signals(1).name = 'Time (Byte 0)';   % Name used in scope legend
 signals(1).index = 1;           % Index in SV vector on SoC
 signals(1).type = 'uint16';     % Data type of 16-bit word (typ. uint16 or int16)
 signals(1).offset = -32768;     % Offset
 signals(1).scale = 1/32768;     % Scaling factor
 
-signals(2).name = 'Time (high)';
-signals(2).index = 2;
+signals(2).name = 'Time (Byte 0)';
+signals(2).index = 1;
 signals(2).type = 'int16';
 signals(2).offset = 0;
 signals(2).scale = 1;
 
-signals(3).name = 'Time (low)';
-signals(3).index = 1;
+signals(3).name = 'Time (Byte 1)';
+signals(3).index = 2;
 signals(3).type = 'int16';
 signals(3).offset = 0;
 signals(3).scale = 1;
@@ -55,8 +57,8 @@ scopes(1).rows = 2;
 for i = 1:length(scopes)
     scopes(i).scope = timescope( ...
         'Name', scopes(i).title, ...
-        'SampleRate', app.samplerate, ...
-        'TimeSpan', app.samples/app.samplerate, ...
+        'SampleRate', app.samplerate/(2^app.decimation), ...
+        'TimeSpan', app.timebase, ...
         'BufferLength', app.samples, ...
         'LayoutDimensions', [scopes(i).rows, scopes(i).columns], ...
         'ChannelNames', {signals([scopes(1).ch(:).signals]).name}, ...
@@ -79,6 +81,7 @@ write(server, 83, 'uint8');     % Header, 'N'
 write(server, 86, 'uint8');     % Header, 'S'
 write(server, mask, 'uint64');  
 write(server, app.samples, 'uint32');
+write(server, app.decimation, 'uint8');
 
 % preallocate processed signal array
 data_disp = zeros(app.samples, length(signals)); 
